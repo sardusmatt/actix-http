@@ -1,363 +1,352 @@
-use std::convert::TryFrom;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::net;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    cmp,
+    error::Error as StdError,
+    future::Future,
+    marker::PhantomData,
+    net,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use actix_rt::time::{Delay, Instant};
+use actix_rt::time::{sleep, Sleep};
 use actix_service::Service;
+use actix_utils::future::poll_fn;
 use bytes::{Bytes, BytesMut};
-use h2::server::{Connection, SendResponse};
-use h2::SendStream;
-use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING};
-use log::{error, trace};
+use futures_core::ready;
+use h2::{
+    server::{Connection, SendResponse},
+    Ping, PingPong,
+};
+use pin_project_lite::pin_project;
+use tracing::{error, trace, warn};
 
-use crate::body::{BodySize, MessageBody, ResponseBody};
-use crate::cloneable::CloneableService;
-use crate::config::ServiceConfig;
-use crate::error::{DispatchError, Error};
-use crate::helpers::DataFactory;
-use crate::httpmessage::HttpMessage;
-use crate::message::ResponseHead;
-use crate::payload::Payload;
-use crate::request::Request;
-use crate::response::Response;
+use crate::{
+    body::{BodySize, BoxBody, MessageBody},
+    config::ServiceConfig,
+    header::{
+        HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING, UPGRADE,
+    },
+    service::HttpFlow,
+    Extensions, OnConnectData, Payload, Request, Response, ResponseHead,
+};
 
 const CHUNK_SIZE: usize = 16_384;
 
-/// Dispatcher for HTTP/2 protocol
-#[pin_project::pin_project]
-pub struct Dispatcher<T, S: Service<Request = Request>, B: MessageBody>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    service: CloneableService<S>,
-    connection: Connection<T, Bytes>,
-    on_connect: Option<Box<dyn DataFactory>>,
-    config: ServiceConfig,
-    peer_addr: Option<net::SocketAddr>,
-    ka_expire: Instant,
-    ka_timer: Option<Delay>,
-    _t: PhantomData<B>,
+pin_project! {
+    /// Dispatcher for HTTP/2 protocol.
+    pub struct Dispatcher<T, S, B, X, U> {
+        flow: Rc<HttpFlow<S, X, U>>,
+        connection: Connection<T, Bytes>,
+        conn_data: Option<Rc<Extensions>>,
+        config: ServiceConfig,
+        peer_addr: Option<net::SocketAddr>,
+        ping_pong: Option<H2PingPong>,
+        _phantom: PhantomData<B>
+    }
 }
 
-impl<T, S, B> Dispatcher<T, S, B>
+impl<T, S, B, X, U> Dispatcher<T, S, B, X, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    S: Service<Request = Request>,
-    S::Error: Into<Error>,
-    // S::Future: 'static,
-    S::Response: Into<Response<B>>,
-    B: MessageBody,
 {
     pub(crate) fn new(
-        service: CloneableService<S>,
-        connection: Connection<T, Bytes>,
-        on_connect: Option<Box<dyn DataFactory>>,
+        mut conn: Connection<T, Bytes>,
+        flow: Rc<HttpFlow<S, X, U>>,
         config: ServiceConfig,
-        timeout: Option<Delay>,
         peer_addr: Option<net::SocketAddr>,
+        conn_data: OnConnectData,
+        timer: Option<Pin<Box<Sleep>>>,
     ) -> Self {
-        // let keepalive = config.keep_alive_enabled();
-        // let flags = if keepalive {
-        // Flags::KEEPALIVE | Flags::KEEPALIVE_ENABLED
-        // } else {
-        //     Flags::empty()
-        // };
+        let ping_pong = config.keep_alive().duration().map(|dur| H2PingPong {
+            timer: timer
+                .map(|mut timer| {
+                    // reuse timer slot if it was initialized for handshake
+                    timer.as_mut().reset((config.now() + dur).into());
+                    timer
+                })
+                .unwrap_or_else(|| Box::pin(sleep(dur))),
+            in_flight: false,
+            ping_pong: conn.ping_pong().unwrap(),
+        });
 
-        // keep-alive timer
-        let (ka_expire, ka_timer) = if let Some(delay) = timeout {
-            (delay.deadline(), Some(delay))
-        } else if let Some(delay) = config.keep_alive_timer() {
-            (delay.deadline(), Some(delay))
-        } else {
-            (config.now(), None)
-        };
-
-        Dispatcher {
-            service,
+        Self {
+            flow,
             config,
             peer_addr,
-            connection,
-            on_connect,
-            ka_expire,
-            ka_timer,
-            _t: PhantomData,
+            connection: conn,
+            conn_data: conn_data.0.map(Rc::new),
+            ping_pong,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<T, S, B> Future for Dispatcher<T, S, B>
+struct H2PingPong {
+    /// Handle to send ping frames from the peer.
+    ping_pong: PingPong,
+
+    /// True when a ping has been sent and is waiting for a reply.
+    in_flight: bool,
+
+    /// Timeout for pong response.
+    timer: Pin<Box<Sleep>>,
+}
+
+impl<T, S, B, X, U> Future for Dispatcher<T, S, B, X, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    S: Service<Request = Request>,
-    S::Error: Into<Error> + 'static,
+
+    S: Service<Request>,
+    S::Error: Into<Response<BoxBody>>,
     S::Future: 'static,
-    S::Response: Into<Response<B>> + 'static,
-    B: MessageBody + 'static,
+    S::Response: Into<Response<B>>,
+
+    B: MessageBody,
 {
-    type Output = Result<(), DispatchError>;
+    type Output = Result<(), crate::error::DispatchError>;
 
     #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         loop {
-            match Pin::new(&mut this.connection).poll_accept(cx) {
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err.into())),
-                Poll::Ready(Some(Ok((req, res)))) => {
-                    // update keep-alive expire
-                    if this.ka_timer.is_some() {
-                        if let Some(expire) = this.config.keep_alive_expire() {
-                            this.ka_expire = expire;
-                        }
-                    }
-
+            match Pin::new(&mut this.connection).poll_accept(cx)? {
+                Poll::Ready(Some((req, tx))) => {
                     let (parts, body) = req.into_parts();
-                    let mut req = Request::with_payload(Payload::<
-                        crate::payload::PayloadStream,
-                    >::H2(
-                        crate::h2::Payload::new(body)
-                    ));
+                    let payload = crate::h2::Payload::new(body);
+                    let pl = Payload::H2 { payload };
+                    let mut req = Request::with_payload(pl);
 
-                    let head = &mut req.head_mut();
+                    let head = req.head_mut();
                     head.uri = parts.uri;
                     head.method = parts.method;
                     head.version = parts.version;
                     head.headers = parts.headers.into();
                     head.peer_addr = this.peer_addr;
 
-                    // set on_connect data
-                    if let Some(ref on_connect) = this.on_connect {
-                        on_connect.set(&mut req.extensions_mut());
-                    }
+                    req.conn_data = this.conn_data.as_ref().map(Rc::clone);
 
-                    actix_rt::spawn(ServiceResponse::<
-                        S::Future,
-                        S::Response,
-                        S::Error,
-                        B,
-                    > {
-                        state: ServiceResponseState::ServiceCall(
-                            this.service.call(req),
-                            Some(res),
-                        ),
-                        config: this.config.clone(),
-                        buffer: None,
-                        _t: PhantomData,
+                    let fut = this.flow.service.call(req);
+                    let config = this.config.clone();
+
+                    // multiplex request handling with spawn task
+                    actix_rt::spawn(async move {
+                        // resolve service call and send response.
+                        let res = match fut.await {
+                            Ok(res) => handle_response(res.into(), tx, config).await,
+                            Err(err) => {
+                                let res: Response<BoxBody> = err.into();
+                                handle_response(res, tx, config).await
+                            }
+                        };
+
+                        // log error.
+                        if let Err(err) = res {
+                            match err {
+                                DispatchError::SendResponse(err) => {
+                                    trace!("Error sending HTTP/2 response: {:?}", err)
+                                }
+                                DispatchError::SendData(err) => warn!("{:?}", err),
+                                DispatchError::ResponseBody(err) => {
+                                    error!("Response payload stream error: {:?}", err)
+                                }
+                            }
+                        }
                     });
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+
+                Poll::Pending => match this.ping_pong.as_mut() {
+                    Some(ping_pong) => loop {
+                        if ping_pong.in_flight {
+                            // When there is an in-flight ping-pong, poll pong and and keep-alive
+                            // timer. On successful pong received, update keep-alive timer to
+                            // determine the next timing of ping pong.
+                            match ping_pong.ping_pong.poll_pong(cx)? {
+                                Poll::Ready(_) => {
+                                    ping_pong.in_flight = false;
+
+                                    let dead_line = this.config.keep_alive_deadline().unwrap();
+                                    ping_pong.timer.as_mut().reset(dead_line.into());
+                                }
+                                Poll::Pending => {
+                                    return ping_pong.timer.as_mut().poll(cx).map(|_| Ok(()));
+                                }
+                            }
+                        } else {
+                            // When there is no in-flight ping-pong, keep-alive timer is used to
+                            // wait for next timing of ping-pong. Therefore, at this point it serves
+                            // as an interval instead.
+                            ready!(ping_pong.timer.as_mut().poll(cx));
+
+                            ping_pong.ping_pong.send_ping(Ping::opaque())?;
+
+                            let dead_line = this.config.keep_alive_deadline().unwrap();
+                            ping_pong.timer.as_mut().reset(dead_line.into());
+
+                            ping_pong.in_flight = true;
+                        }
+                    },
+                    None => return Poll::Pending,
+                },
             }
         }
     }
 }
 
-#[pin_project::pin_project]
-struct ServiceResponse<F, I, E, B> {
-    state: ServiceResponseState<F, B>,
+enum DispatchError {
+    SendResponse(h2::Error),
+    SendData(h2::Error),
+    ResponseBody(Box<dyn StdError>),
+}
+
+async fn handle_response<B>(
+    res: Response<B>,
+    mut tx: SendResponse<Bytes>,
     config: ServiceConfig,
-    buffer: Option<Bytes>,
-    _t: PhantomData<(I, E)>,
-}
-
-enum ServiceResponseState<F, B> {
-    ServiceCall(F, Option<SendResponse<Bytes>>),
-    SendPayload(SendStream<Bytes>, ResponseBody<B>),
-}
-
-impl<F, I, E, B> ServiceResponse<F, I, E, B>
+) -> Result<(), DispatchError>
 where
-    F: Future<Output = Result<I, E>>,
-    E: Into<Error>,
-    I: Into<Response<B>>,
     B: MessageBody,
 {
-    fn prepare_response(
-        &self,
-        head: &ResponseHead,
-        size: &mut BodySize,
-    ) -> http::Response<()> {
-        let mut has_date = false;
-        let mut skip_len = size != &BodySize::Stream;
+    let (res, body) = res.replace_body(());
 
-        let mut res = http::Response::new(());
-        *res.status_mut() = head.status;
-        *res.version_mut() = http::Version::HTTP_2;
+    // prepare response.
+    let mut size = body.size();
+    let res = prepare_response(config, res.head(), &mut size);
+    let eof = size.is_eof();
 
-        // Content length
-        match head.status {
-            http::StatusCode::NO_CONTENT
-            | http::StatusCode::CONTINUE
-            | http::StatusCode::PROCESSING => *size = BodySize::None,
-            http::StatusCode::SWITCHING_PROTOCOLS => {
-                skip_len = true;
-                *size = BodySize::Stream;
-            }
-            _ => (),
-        }
-        let _ = match size {
-            BodySize::None | BodySize::Stream => None,
-            BodySize::Empty => res
-                .headers_mut()
-                .insert(CONTENT_LENGTH, HeaderValue::from_static("0")),
-            BodySize::Sized(len) => res.headers_mut().insert(
-                CONTENT_LENGTH,
-                HeaderValue::try_from(format!("{}", len)).unwrap(),
-            ),
-            BodySize::Sized64(len) => res.headers_mut().insert(
-                CONTENT_LENGTH,
-                HeaderValue::try_from(format!("{}", len)).unwrap(),
-            ),
-        };
+    // send response head and return on eof.
+    let mut stream = tx
+        .send_response(res, eof)
+        .map_err(DispatchError::SendResponse)?;
 
-        // copy headers
-        for (key, value) in head.headers.iter() {
-            match *key {
-                CONNECTION | TRANSFER_ENCODING => continue, // http2 specific
-                CONTENT_LENGTH if skip_len => continue,
-                DATE => has_date = true,
-                _ => (),
-            }
-            res.headers_mut().append(key, value.clone());
-        }
-
-        // set date header
-        if !has_date {
-            let mut bytes = BytesMut::with_capacity(29);
-            self.config.set_date_header(&mut bytes);
-            res.headers_mut().insert(DATE, unsafe {
-                HeaderValue::from_maybe_shared_unchecked(bytes.freeze())
-            });
-        }
-
-        res
+    if eof {
+        return Ok(());
     }
-}
 
-impl<F, I, E, B> Future for ServiceResponse<F, I, E, B>
-where
-    F: Future<Output = Result<I, E>>,
-    E: Into<Error>,
-    I: Into<Response<B>>,
-    B: MessageBody,
-{
-    type Output = ();
+    // poll response body and send chunks to client
+    actix_rt::pin!(body);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.as_mut().project();
+    while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+        let mut chunk = res.map_err(|err| DispatchError::ResponseBody(err.into()))?;
 
-        match this.state {
-            ServiceResponseState::ServiceCall(ref mut call, ref mut send) => {
-                match unsafe { Pin::new_unchecked(call) }.poll(cx) {
-                    Poll::Ready(Ok(res)) => {
-                        let (res, body) = res.into().replace_body(());
+        'send: loop {
+            let chunk_size = cmp::min(chunk.len(), CHUNK_SIZE);
 
-                        let mut send = send.take().unwrap();
-                        let mut size = body.size();
-                        let h2_res =
-                            self.as_mut().prepare_response(res.head(), &mut size);
-                        this = self.as_mut().project();
+            // reserve enough space and wait for stream ready.
+            stream.reserve_capacity(chunk_size);
 
-                        let stream = match send.send_response(h2_res, size.is_eof()) {
-                            Err(e) => {
-                                trace!("Error sending h2 response: {:?}", e);
-                                return Poll::Ready(());
-                            }
-                            Ok(stream) => stream,
-                        };
+            match poll_fn(|cx| stream.poll_capacity(cx)).await {
+                // No capacity left. drop body and return.
+                None => return Ok(()),
 
-                        if size.is_eof() {
-                            Poll::Ready(())
-                        } else {
-                            *this.state =
-                                ServiceResponseState::SendPayload(stream, body);
-                            self.poll(cx)
-                        }
-                    }
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Err(e)) => {
-                        let res: Response = e.into().into();
-                        let (res, body) = res.replace_body(());
+                Some(Err(err)) => return Err(DispatchError::SendData(err)),
 
-                        let mut send = send.take().unwrap();
-                        let mut size = body.size();
-                        let h2_res =
-                            self.as_mut().prepare_response(res.head(), &mut size);
-                        this = self.as_mut().project();
+                Some(Ok(cap)) => {
+                    // split chunk to writeable size and send to client
+                    let len = chunk.len();
+                    let bytes = chunk.split_to(cmp::min(len, cap));
 
-                        let stream = match send.send_response(h2_res, size.is_eof()) {
-                            Err(e) => {
-                                trace!("Error sending h2 response: {:?}", e);
-                                return Poll::Ready(());
-                            }
-                            Ok(stream) => stream,
-                        };
+                    stream
+                        .send_data(bytes, false)
+                        .map_err(DispatchError::SendData)?;
 
-                        if size.is_eof() {
-                            Poll::Ready(())
-                        } else {
-                            *this.state = ServiceResponseState::SendPayload(
-                                stream,
-                                body.into_body(),
-                            );
-                            self.poll(cx)
-                        }
+                    // Current chuck completely sent. break send loop and poll next one.
+                    if chunk.is_empty() {
+                        break 'send;
                     }
                 }
             }
-            ServiceResponseState::SendPayload(ref mut stream, ref mut body) => loop {
-                loop {
-                    if let Some(ref mut buffer) = this.buffer {
-                        match stream.poll_capacity(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(None) => return Poll::Ready(()),
-                            Poll::Ready(Some(Ok(cap))) => {
-                                let len = buffer.len();
-                                let bytes = buffer.split_to(std::cmp::min(cap, len));
-
-                                if let Err(e) = stream.send_data(bytes, false) {
-                                    warn!("{:?}", e);
-                                    return Poll::Ready(());
-                                } else if !buffer.is_empty() {
-                                    let cap = std::cmp::min(buffer.len(), CHUNK_SIZE);
-                                    stream.reserve_capacity(cap);
-                                } else {
-                                    this.buffer.take();
-                                }
-                            }
-                            Poll::Ready(Some(Err(e))) => {
-                                warn!("{:?}", e);
-                                return Poll::Ready(());
-                            }
-                        }
-                    } else {
-                        match body.poll_next(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(None) => {
-                                if let Err(e) = stream.send_data(Bytes::new(), true) {
-                                    warn!("{:?}", e);
-                                }
-                                return Poll::Ready(());
-                            }
-                            Poll::Ready(Some(Ok(chunk))) => {
-                                stream.reserve_capacity(std::cmp::min(
-                                    chunk.len(),
-                                    CHUNK_SIZE,
-                                ));
-                                *this.buffer = Some(chunk);
-                            }
-                            Poll::Ready(Some(Err(e))) => {
-                                error!("Response payload stream error: {:?}", e);
-                                return Poll::Ready(());
-                            }
-                        }
-                    }
-                }
-            },
         }
     }
+
+    // response body streaming finished. send end of stream and return.
+    stream
+        .send_data(Bytes::new(), true)
+        .map_err(DispatchError::SendData)?;
+
+    Ok(())
+}
+
+fn prepare_response(
+    config: ServiceConfig,
+    head: &ResponseHead,
+    size: &mut BodySize,
+) -> http::Response<()> {
+    let mut has_date = false;
+    let mut skip_len = size != &BodySize::Stream;
+
+    let mut res = http::Response::new(());
+    *res.status_mut() = head.status;
+    *res.version_mut() = http::Version::HTTP_2;
+
+    // Content length
+    match head.status {
+        http::StatusCode::NO_CONTENT
+        | http::StatusCode::CONTINUE
+        | http::StatusCode::PROCESSING => *size = BodySize::None,
+        http::StatusCode::SWITCHING_PROTOCOLS => {
+            skip_len = true;
+            *size = BodySize::Stream;
+        }
+        _ => {}
+    }
+
+    match size {
+        BodySize::None | BodySize::Stream => {}
+
+        BodySize::Sized(0) => {
+            #[allow(clippy::declare_interior_mutable_const)]
+            const HV_ZERO: HeaderValue = HeaderValue::from_static("0");
+            res.headers_mut().insert(CONTENT_LENGTH, HV_ZERO);
+        }
+
+        BodySize::Sized(len) => {
+            let mut buf = itoa::Buffer::new();
+
+            res.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(buf.format(*len)).unwrap(),
+            );
+        }
+    };
+
+    // copy headers
+    for (key, value) in head.headers.iter() {
+        match key {
+            // omit HTTP/1.x only headers according to:
+            // https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
+            &CONNECTION | &TRANSFER_ENCODING | &UPGRADE => continue,
+
+            &CONTENT_LENGTH if skip_len => continue,
+            &DATE => has_date = true,
+
+            // omit HTTP/1.x only headers according to:
+            // https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
+            hdr if hdr == HeaderName::from_static("keep-alive")
+                || hdr == HeaderName::from_static("proxy-connection") =>
+            {
+                continue
+            }
+
+            _ => {}
+        }
+
+        res.headers_mut().append(key, value.clone());
+    }
+
+    // set date header
+    if !has_date {
+        let mut bytes = BytesMut::with_capacity(29);
+        config.write_date_header_value(&mut bytes);
+        res.headers_mut().insert(
+            DATE,
+            // SAFETY: serialized date-times are known ASCII strings
+            unsafe { HeaderValue::from_maybe_shared_unchecked(bytes.freeze()) },
+        );
+    }
+
+    res
 }

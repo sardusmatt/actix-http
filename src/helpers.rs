@@ -1,235 +1,192 @@
-use std::{io, mem, ptr, slice};
+use std::io;
 
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use http::Version;
 
-use crate::extensions::Extensions;
+const DIGITS_START: u8 = b'0';
 
-const DEC_DIGITS_LUT: &[u8] = b"0001020304050607080910111213141516171819\
-      2021222324252627282930313233343536373839\
-      4041424344454647484950515253545556575859\
-      6061626364656667686970717273747576777879\
-      8081828384858687888990919293949596979899";
-
-pub(crate) const STATUS_LINE_BUF_SIZE: usize = 13;
-
-pub(crate) fn write_status_line(version: Version, mut n: u16, bytes: &mut BytesMut) {
-    let mut buf: [u8; STATUS_LINE_BUF_SIZE] = [
-        b'H', b'T', b'T', b'P', b'/', b'1', b'.', b'1', b' ', b' ', b' ', b' ', b' ',
-    ];
+pub(crate) fn write_status_line<B: BufMut>(version: Version, n: u16, buf: &mut B) {
     match version {
-        Version::HTTP_2 => buf[5] = b'2',
-        Version::HTTP_10 => buf[7] = b'0',
-        Version::HTTP_09 => {
-            buf[5] = b'0';
-            buf[7] = b'9';
-        }
-        _ => (),
-    }
-
-    let mut curr: isize = 12;
-    let buf_ptr = buf.as_mut_ptr();
-    let lut_ptr = DEC_DIGITS_LUT.as_ptr();
-    let four = n > 999;
-
-    // decode 2 more chars, if > 2 chars
-    let d1 = (n % 100) << 1;
-    n /= 100;
-    curr -= 2;
-    unsafe {
-        ptr::copy_nonoverlapping(lut_ptr.offset(d1 as isize), buf_ptr.offset(curr), 2);
-    }
-
-    // decode last 1 or 2 chars
-    if n < 10 {
-        curr -= 1;
-        unsafe {
-            *buf_ptr.offset(curr) = (n as u8) + b'0';
-        }
-    } else {
-        let d1 = n << 1;
-        curr -= 2;
-        unsafe {
-            ptr::copy_nonoverlapping(
-                lut_ptr.offset(d1 as isize),
-                buf_ptr.offset(curr),
-                2,
-            );
+        Version::HTTP_11 => buf.put_slice(b"HTTP/1.1 "),
+        Version::HTTP_10 => buf.put_slice(b"HTTP/1.0 "),
+        Version::HTTP_09 => buf.put_slice(b"HTTP/0.9 "),
+        _ => {
+            // other HTTP version handlers do not use this method
         }
     }
 
-    bytes.put_slice(&buf);
-    if four {
-        bytes.put_u8(b' ');
-    }
+    let d100 = (n / 100) as u8;
+    let d10 = ((n / 10) % 10) as u8;
+    let d1 = (n % 10) as u8;
+
+    buf.put_u8(DIGITS_START + d100);
+    buf.put_u8(DIGITS_START + d10);
+    buf.put_u8(DIGITS_START + d1);
+
+    // trailing space before reason
+    buf.put_u8(b' ');
 }
 
-/// NOTE: bytes object has to contain enough space
-pub fn write_content_length(mut n: usize, bytes: &mut BytesMut) {
-    if n < 10 {
-        let mut buf: [u8; 21] = [
-            b'\r', b'\n', b'c', b'o', b'n', b't', b'e', b'n', b't', b'-', b'l', b'e',
-            b'n', b'g', b't', b'h', b':', b' ', b'0', b'\r', b'\n',
-        ];
-        buf[18] = (n as u8) + b'0';
-        bytes.put_slice(&buf);
-    } else if n < 100 {
-        let mut buf: [u8; 22] = [
-            b'\r', b'\n', b'c', b'o', b'n', b't', b'e', b'n', b't', b'-', b'l', b'e',
-            b'n', b'g', b't', b'h', b':', b' ', b'0', b'0', b'\r', b'\n',
-        ];
-        let d1 = n << 1;
-        unsafe {
-            ptr::copy_nonoverlapping(
-                DEC_DIGITS_LUT.as_ptr().add(d1),
-                buf.as_mut_ptr().offset(18),
-                2,
-            );
+/// Write out content length header.
+///
+/// Buffer must to contain enough space or be implicitly extendable.
+pub fn write_content_length<B: BufMut>(n: u64, buf: &mut B, camel_case: bool) {
+    if n == 0 {
+        if camel_case {
+            buf.put_slice(b"\r\nContent-Length: 0\r\n");
+        } else {
+            buf.put_slice(b"\r\ncontent-length: 0\r\n");
         }
-        bytes.put_slice(&buf);
-    } else if n < 1000 {
-        let mut buf: [u8; 23] = [
-            b'\r', b'\n', b'c', b'o', b'n', b't', b'e', b'n', b't', b'-', b'l', b'e',
-            b'n', b'g', b't', b'h', b':', b' ', b'0', b'0', b'0', b'\r', b'\n',
-        ];
-        // decode 2 more chars, if > 2 chars
-        let d1 = (n % 100) << 1;
-        n /= 100;
-        unsafe {
-            ptr::copy_nonoverlapping(
-                DEC_DIGITS_LUT.as_ptr().add(d1),
-                buf.as_mut_ptr().offset(19),
-                2,
-            )
-        };
 
-        // decode last 1
-        buf[18] = (n as u8) + b'0';
-
-        bytes.put_slice(&buf);
-    } else {
-        bytes.put_slice(b"\r\ncontent-length: ");
-        convert_usize(n, bytes);
+        return;
     }
+
+    let mut buffer = itoa::Buffer::new();
+
+    if camel_case {
+        buf.put_slice(b"\r\nContent-Length: ");
+    } else {
+        buf.put_slice(b"\r\ncontent-length: ");
+    }
+
+    buf.put_slice(buffer.format(n).as_bytes());
+    buf.put_slice(b"\r\n");
 }
 
-pub(crate) fn convert_usize(mut n: usize, bytes: &mut BytesMut) {
-    let mut curr: isize = 39;
-    let mut buf: [u8; 41] = unsafe { mem::MaybeUninit::uninit().assume_init() };
-    buf[39] = b'\r';
-    buf[40] = b'\n';
-    let buf_ptr = buf.as_mut_ptr();
-    let lut_ptr = DEC_DIGITS_LUT.as_ptr();
+/// An `io::Write`r that only requires mutable reference and assumes that there is space available
+/// in the buffer for every write operation or that it can be extended implicitly (like
+/// `bytes::BytesMut`, for example).
+///
+/// This is slightly faster (~10%) than `bytes::buf::Writer` in such cases because it does not
+/// perform a remaining length check before writing.
+pub(crate) struct MutWriter<'a, B>(pub(crate) &'a mut B);
 
-    // eagerly decode 4 characters at a time
-    while n >= 10_000 {
-        let rem = (n % 10_000) as isize;
-        n /= 10_000;
-
-        let d1 = (rem / 100) << 1;
-        let d2 = (rem % 100) << 1;
-        curr -= 4;
-        unsafe {
-            ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
-            ptr::copy_nonoverlapping(lut_ptr.offset(d2), buf_ptr.offset(curr + 2), 2);
-        }
-    }
-
-    // if we reach here numbers are <= 9999, so at most 4 chars long
-    let mut n = n as isize; // possibly reduce 64bit math
-
-    // decode 2 more chars, if > 2 chars
-    if n >= 100 {
-        let d1 = (n % 100) << 1;
-        n /= 100;
-        curr -= 2;
-        unsafe {
-            ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
-        }
-    }
-
-    // decode last 1 or 2 chars
-    if n < 10 {
-        curr -= 1;
-        unsafe {
-            *buf_ptr.offset(curr) = (n as u8) + b'0';
-        }
-    } else {
-        let d1 = n << 1;
-        curr -= 2;
-        unsafe {
-            ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
-        }
-    }
-
-    unsafe {
-        bytes.extend_from_slice(slice::from_raw_parts(
-            buf_ptr.offset(curr),
-            41 - curr as usize,
-        ));
-    }
-}
-
-pub(crate) struct Writer<'a>(pub &'a mut BytesMut);
-
-impl<'a> io::Write for Writer<'a> {
+impl<'a, B> io::Write for MutWriter<'a, B>
+where
+    B: BufMut,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.extend_from_slice(buf);
+        self.0.put_slice(buf);
         Ok(buf.len())
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-pub(crate) trait DataFactory {
-    fn set(&self, ext: &mut Extensions);
-}
-
-pub(crate) struct Data<T>(pub(crate) T);
-
-impl<T: Clone + 'static> DataFactory for Data<T> {
-    fn set(&self, ext: &mut Extensions) {
-        ext.insert(self.0.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::str::from_utf8;
+
+    use bytes::BytesMut;
+
     use super::*;
+
+    #[test]
+    fn test_status_line() {
+        let mut bytes = BytesMut::new();
+        bytes.reserve(50);
+        write_status_line(Version::HTTP_11, 200, &mut bytes);
+        assert_eq!(from_utf8(&bytes.split().freeze()).unwrap(), "HTTP/1.1 200 ");
+
+        let mut bytes = BytesMut::new();
+        bytes.reserve(50);
+        write_status_line(Version::HTTP_09, 404, &mut bytes);
+        assert_eq!(from_utf8(&bytes.split().freeze()).unwrap(), "HTTP/0.9 404 ");
+
+        let mut bytes = BytesMut::new();
+        bytes.reserve(50);
+        write_status_line(Version::HTTP_09, 515, &mut bytes);
+        assert_eq!(from_utf8(&bytes.split().freeze()).unwrap(), "HTTP/0.9 515 ");
+    }
 
     #[test]
     fn test_write_content_length() {
         let mut bytes = BytesMut::new();
         bytes.reserve(50);
-        write_content_length(0, &mut bytes);
+        write_content_length(0, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 0\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(9, &mut bytes);
+        write_content_length(9, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 9\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(10, &mut bytes);
+        write_content_length(10, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 10\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(99, &mut bytes);
+        write_content_length(99, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 99\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(100, &mut bytes);
+        write_content_length(100, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 100\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(101, &mut bytes);
+        write_content_length(101, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 101\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(998, &mut bytes);
+        write_content_length(998, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 998\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(1000, &mut bytes);
+        write_content_length(1000, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 1000\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(1001, &mut bytes);
+        write_content_length(1001, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 1001\r\n"[..]);
         bytes.reserve(50);
-        write_content_length(5909, &mut bytes);
+        write_content_length(5909, &mut bytes, false);
         assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 5909\r\n"[..]);
+        bytes.reserve(50);
+        write_content_length(9999, &mut bytes, false);
+        assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 9999\r\n"[..]);
+        bytes.reserve(50);
+        write_content_length(10001, &mut bytes, false);
+        assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 10001\r\n"[..]);
+        bytes.reserve(50);
+        write_content_length(59094, &mut bytes, false);
+        assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 59094\r\n"[..]);
+        bytes.reserve(50);
+        write_content_length(99999, &mut bytes, false);
+        assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 99999\r\n"[..]);
+
+        bytes.reserve(50);
+        write_content_length(590947, &mut bytes, false);
+        assert_eq!(
+            bytes.split().freeze(),
+            b"\r\ncontent-length: 590947\r\n"[..]
+        );
+        bytes.reserve(50);
+        write_content_length(999999, &mut bytes, false);
+        assert_eq!(
+            bytes.split().freeze(),
+            b"\r\ncontent-length: 999999\r\n"[..]
+        );
+        bytes.reserve(50);
+        write_content_length(5909471, &mut bytes, false);
+        assert_eq!(
+            bytes.split().freeze(),
+            b"\r\ncontent-length: 5909471\r\n"[..]
+        );
+        bytes.reserve(50);
+        write_content_length(59094718, &mut bytes, false);
+        assert_eq!(
+            bytes.split().freeze(),
+            b"\r\ncontent-length: 59094718\r\n"[..]
+        );
+        bytes.reserve(50);
+        write_content_length(4294973728, &mut bytes, false);
+        assert_eq!(
+            bytes.split().freeze(),
+            b"\r\ncontent-length: 4294973728\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn write_content_length_camel_case() {
+        let mut bytes = BytesMut::new();
+        write_content_length(0, &mut bytes, false);
+        assert_eq!(bytes.split().freeze(), b"\r\ncontent-length: 0\r\n"[..]);
+
+        let mut bytes = BytesMut::new();
+        write_content_length(0, &mut bytes, true);
+        assert_eq!(bytes.split().freeze(), b"\r\nContent-Length: 0\r\n"[..]);
     }
 }

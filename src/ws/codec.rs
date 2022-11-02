@@ -1,48 +1,64 @@
-use actix_codec::{Decoder, Encoder};
+use bitflags::bitflags;
 use bytes::{Bytes, BytesMut};
+use bytestring::ByteString;
+use tokio_util::codec::{Decoder, Encoder};
+use tracing::error;
 
-use super::frame::Parser;
-use super::proto::{CloseReason, OpCode};
-use super::ProtocolError;
+use super::{
+    frame::Parser,
+    proto::{CloseReason, OpCode},
+    ProtocolError,
+};
 
-/// `WebSocket` Message
-#[derive(Debug, PartialEq)]
+/// A WebSocket message.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Message {
-    /// Text message
-    Text(String),
-    /// Binary message
+    /// Text message.
+    Text(ByteString),
+
+    /// Binary message.
     Binary(Bytes),
-    /// Continuation
+
+    /// Continuation.
     Continuation(Item),
-    /// Ping message
+
+    /// Ping message.
     Ping(Bytes),
-    /// Pong message
+
+    /// Pong message.
     Pong(Bytes),
-    /// Close message with optional reason
+
+    /// Close message with optional reason.
     Close(Option<CloseReason>),
-    /// No-op. Useful for actix-net services
+
+    /// No-op. Useful for low-level services.
     Nop,
 }
 
-/// `WebSocket` frame
-#[derive(Debug, PartialEq)]
+/// A WebSocket frame.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
-    /// Text frame, codec does not verify utf8 encoding
+    /// Text frame. Note that the codec does not validate UTF-8 encoding.
     Text(Bytes),
-    /// Binary frame
+
+    /// Binary frame.
     Binary(Bytes),
-    /// Continuation
+
+    /// Continuation.
     Continuation(Item),
-    /// Ping message
+
+    /// Ping message.
     Ping(Bytes),
-    /// Pong message
+
+    /// Pong message.
     Pong(Bytes),
-    /// Close message with optional reason
+
+    /// Close message with optional reason.
     Close(Option<CloseReason>),
 }
 
-/// `WebSocket` continuation item
-#[derive(Debug, PartialEq)]
+/// A WebSocket continuation item.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Item {
     FirstText(Bytes),
     FirstBinary(Bytes),
@@ -50,14 +66,14 @@ pub enum Item {
     Last(Bytes),
 }
 
-#[derive(Debug, Copy, Clone)]
-/// WebSockets protocol codec
+/// WebSocket protocol codec.
+#[derive(Debug, Clone)]
 pub struct Codec {
     flags: Flags,
     max_size: usize,
 }
 
-bitflags::bitflags! {
+bitflags! {
     struct Flags: u8 {
         const SERVER         = 0b0000_0001;
         const CONTINUATION   = 0b0000_0010;
@@ -66,17 +82,18 @@ bitflags::bitflags! {
 }
 
 impl Codec {
-    /// Create new websocket frames decoder
-    pub fn new() -> Codec {
+    /// Create new WebSocket frames decoder.
+    pub const fn new() -> Codec {
         Codec {
             max_size: 65_536,
             flags: Flags::SERVER,
         }
     }
 
-    /// Set max frame size
+    /// Set max frame size.
     ///
-    /// By default max size is set to 64kb
+    /// By default max size is set to 64KiB.
+    #[must_use = "This returns the a new Codec, without modifying the original."]
     pub fn max_size(mut self, size: usize) -> Self {
         self.max_size = size;
         self
@@ -85,14 +102,20 @@ impl Codec {
     /// Set decoder to client mode.
     ///
     /// By default decoder works in server mode.
+    #[must_use = "This returns the a new Codec, without modifying the original."]
     pub fn client_mode(mut self) -> Self {
         self.flags.remove(Flags::SERVER);
         self
     }
 }
 
-impl Encoder for Codec {
-    type Item = Message;
+impl Default for Codec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder<Message> for Codec {
     type Error = ProtocolError;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -137,7 +160,7 @@ impl Encoder for Codec {
                         Parser::write_message(
                             dst,
                             &data[..],
-                            OpCode::Binary,
+                            OpCode::Text,
                             false,
                             !self.flags.contains(Flags::SERVER),
                         )
@@ -151,7 +174,7 @@ impl Encoder for Codec {
                         Parser::write_message(
                             dst,
                             &data[..],
-                            OpCode::Text,
+                            OpCode::Binary,
                             false,
                             !self.flags.contains(Flags::SERVER),
                         )
@@ -185,7 +208,7 @@ impl Encoder for Codec {
                     }
                 }
             },
-            Message::Nop => (),
+            Message::Nop => {}
         }
         Ok(())
     }
@@ -204,9 +227,7 @@ impl Decoder for Codec {
                         OpCode::Continue => {
                             if self.flags.contains(Flags::CONTINUATION) {
                                 Ok(Some(Frame::Continuation(Item::Continue(
-                                    payload
-                                        .map(|pl| pl.freeze())
-                                        .unwrap_or_else(Bytes::new),
+                                    payload.map(|pl| pl.freeze()).unwrap_or_else(Bytes::new),
                                 ))))
                             } else {
                                 Err(ProtocolError::ContinuationNotStarted)
@@ -216,9 +237,7 @@ impl Decoder for Codec {
                             if !self.flags.contains(Flags::CONTINUATION) {
                                 self.flags.insert(Flags::CONTINUATION);
                                 Ok(Some(Frame::Continuation(Item::FirstBinary(
-                                    payload
-                                        .map(|pl| pl.freeze())
-                                        .unwrap_or_else(Bytes::new),
+                                    payload.map(|pl| pl.freeze()).unwrap_or_else(Bytes::new),
                                 ))))
                             } else {
                                 Err(ProtocolError::ContinuationStarted)
@@ -228,9 +247,7 @@ impl Decoder for Codec {
                             if !self.flags.contains(Flags::CONTINUATION) {
                                 self.flags.insert(Flags::CONTINUATION);
                                 Ok(Some(Frame::Continuation(Item::FirstText(
-                                    payload
-                                        .map(|pl| pl.freeze())
-                                        .unwrap_or_else(Bytes::new),
+                                    payload.map(|pl| pl.freeze()).unwrap_or_else(Bytes::new),
                                 ))))
                             } else {
                                 Err(ProtocolError::ContinuationStarted)

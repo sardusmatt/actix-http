@@ -1,16 +1,13 @@
-use std::fmt::{self, Display};
-use std::str::FromStr;
+use std::{fmt, str};
 
 use self::Charset::*;
 
-/// A Mime charset.
+/// A MIME character set.
 ///
 /// The string representation is normalized to upper case.
 ///
-/// See [http://www.iana.org/assignments/character-sets/character-sets.xhtml][url].
-///
-/// [url]: http://www.iana.org/assignments/character-sets/character-sets.xhtml
-#[derive(Clone, Debug, PartialEq)]
+/// See <http://www.iana.org/assignments/character-sets/character-sets.xhtml>.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum Charset {
     /// US ASCII
@@ -90,23 +87,23 @@ impl Charset {
             Iso_8859_8_E => "ISO-8859-8-E",
             Iso_8859_8_I => "ISO-8859-8-I",
             Gb2312 => "GB2312",
-            Big5 => "big5",
+            Big5 => "Big5",
             Koi8_R => "KOI8-R",
             Ext(ref s) => s,
         }
     }
 }
 
-impl Display for Charset {
+impl fmt::Display for Charset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
     }
 }
 
-impl FromStr for Charset {
+impl str::FromStr for Charset {
     type Err = crate::Error;
 
-    fn from_str(s: &str) -> crate::Result<Charset> {
+    fn from_str(s: &str) -> Result<Charset, crate::Error> {
         Ok(match s.to_ascii_uppercase().as_ref() {
             "US-ASCII" => Us_Ascii,
             "ISO-8859-1" => Iso_8859_1,
@@ -130,24 +127,29 @@ impl FromStr for Charset {
             "ISO-8859-8-E" => Iso_8859_8_E,
             "ISO-8859-8-I" => Iso_8859_8_I,
             "GB2312" => Gb2312,
-            "big5" => Big5,
+            "BIG5" => Big5,
             "KOI8-R" => Koi8_R,
             s => Ext(s.to_owned()),
         })
     }
 }
 
-#[test]
-fn test_parse() {
-    assert_eq!(Us_Ascii, "us-ascii".parse().unwrap());
-    assert_eq!(Us_Ascii, "US-Ascii".parse().unwrap());
-    assert_eq!(Us_Ascii, "US-ASCII".parse().unwrap());
-    assert_eq!(Shift_Jis, "Shift-JIS".parse().unwrap());
-    assert_eq!(Ext("ABCD".to_owned()), "abcd".parse().unwrap());
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn test_display() {
-    assert_eq!("US-ASCII", format!("{}", Us_Ascii));
-    assert_eq!("ABCD", format!("{}", Ext("ABCD".to_owned())));
+    #[test]
+    fn test_parse() {
+        assert_eq!(Us_Ascii, "us-ascii".parse().unwrap());
+        assert_eq!(Us_Ascii, "US-Ascii".parse().unwrap());
+        assert_eq!(Us_Ascii, "US-ASCII".parse().unwrap());
+        assert_eq!(Shift_Jis, "Shift-JIS".parse().unwrap());
+        assert_eq!(Ext("ABCD".to_owned()), "abcd".parse().unwrap());
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!("US-ASCII", format!("{}", Us_Ascii));
+        assert_eq!("ABCD", format!("{}", Ext("ABCD".to_owned())));
+    }
 }
